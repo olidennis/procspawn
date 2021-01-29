@@ -1,3 +1,6 @@
+use ipc_channel::ipc::OpaqueIpcMessage;
+use ipc_channel::ipc::OpaqueIpcReceiver;
+use ipc_channel::ipc::{IpcReceiverSet,IpcSelectionResult};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -6,9 +9,9 @@ use std::process::Stdio;
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration};
 use std::{env, mem, process};
-use std::{io, thread};
+use std::io;
 
 use ipc_channel::ipc::{self, IpcOneShotServer, IpcReceiver, IpcSender};
 use serde::{de::DeserializeOwned, Serialize};
@@ -296,7 +299,7 @@ impl Builder {
         })?;
 
         Ok(ProcessHandle {
-            recv: return_rx,
+            recv: Some(return_rx),
             state: Arc::new(ProcessHandleState::new(Some(process.id()))),
             process,
         })
@@ -337,7 +340,7 @@ impl ProcessHandleState {
 }
 
 pub struct ProcessHandle<T> {
-    pub(crate) recv: IpcReceiver<Result<T, PanicInfo>>,
+    pub(crate) recv: Option<IpcReceiver<Result<T, PanicInfo>>>,
     pub(crate) process: process::Child,
     pub(crate) state: Arc<ProcessHandleState>,
 }
@@ -384,36 +387,47 @@ impl<T> ProcessHandle<T> {
 
 impl<T: Serialize + DeserializeOwned> ProcessHandle<T> {
     pub fn join(&mut self) -> Result<T, SpawnError> {
-        let rv = with_ipc_mode(|| self.recv.recv())?.map_err(Into::into);
+        let rv = with_ipc_mode(|| self.recv.as_ref().unwrap().recv())?.map_err(Into::into);
         self.wait();
         rv
     }
 
     pub fn join_timeout(&mut self, timeout: Duration) -> Result<T, SpawnError> {
-        let deadline = match Instant::now().checked_add(timeout) {
-            Some(deadline) => deadline,
-            None => {
-                return Err(io::Error::new(io::ErrorKind::Other, "timeout out of bounds").into())
-            }
-        };
-        let mut to_sleep = Duration::from_millis(1);
-        let rv = loop {
-            match with_ipc_mode(|| self.recv.try_recv()) {
-                Ok(rv) => break rv.map_err(Into::into),
-                Err(err) if is_ipc_timeout(&err) => {
-                    if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-                        thread::sleep(remaining.min(to_sleep));
-                        to_sleep *= 2;
-                    } else {
-                        return Err(SpawnError::new_timeout());
+        let mut rx_set = IpcReceiverSet::new().unwrap();
+        
+        let timeout = crate::spawn(timeout, |timeout| {
+            std::thread::sleep(timeout);
+        });
+
+        if let JoinHandleInner::Process(mut timeout_process_handle) = timeout.inner.unwrap() {
+
+            let _id_real = rx_set.add(self.recv.take().unwrap()).unwrap();
+            let id_timeout = rx_set.add(timeout_process_handle.recv.take().unwrap()).unwrap();
+
+            for event in rx_set.select().unwrap() {
+                match event {
+                    IpcSelectionResult::MessageReceived(id, message) => {
+                        if id == id_timeout {
+                            self.kill().unwrap();
+                            timeout_process_handle.wait();
+                            return Err(SpawnError::new_timeout());
+                        } else {
+                            let rx_data: Result<T, PanicInfo> = with_ipc_mode(||message.to().unwrap());
+                            timeout_process_handle.kill().unwrap();
+                            self.wait();
+                            return rx_data.map_err(Into::into);
+                        }
+                    },
+                    IpcSelectionResult::ChannelClosed(_id) => {
+                        panic!("ChannelClosed: shouldn't happen");
                     }
                 }
-                Err(err) => return Err(err.into()),
             }
-        };
 
-        self.wait();
-        rv
+        } else {
+            panic!("shouldn't happen");
+        }
+        unreachable!();
     }
 }
 
@@ -541,3 +555,69 @@ pub fn spawn<A: Serialize + DeserializeOwned, R: Serialize + DeserializeOwned>(
 ) -> JoinHandle<R> {
     Builder::new().spawn(args, f)
 }
+
+pub trait Joinable {
+    fn intercept(&mut self) -> (OpaqueIpcReceiver, Box<dyn Fn(OpaqueIpcMessage) + 'static >);
+}
+
+impl<T: Serialize + DeserializeOwned + 'static> Joinable for JoinHandle<T> {
+    fn intercept(&mut self) -> (OpaqueIpcReceiver, Box<dyn Fn(OpaqueIpcMessage) + 'static >) { 
+        
+        match self.inner {
+            Ok(JoinHandleInner::Process(ref mut handle)) => {
+        
+                let (tx,rx) = ipc_channel::ipc::channel().unwrap();
+                let oldrx = handle.recv.take().unwrap();
+                handle.recv = Some(rx);
+                let give_back = move |message: OpaqueIpcMessage| {
+                    let rx_data: Result<T, PanicInfo> = with_ipc_mode(||message.to().unwrap());
+                    tx.send(rx_data).unwrap();
+                };
+                return (oldrx.to_opaque(),Box::new(give_back));
+            },
+            Ok(JoinHandleInner::Pooled(_)) => panic!("not supported for pooled"),
+            Err(_) => panic!("shouldn't happen"),
+        }
+    }
+
+}
+
+pub struct MultiWait {
+    set : IpcReceiverSet,
+    map : HashMap<u64, Box<dyn Fn(OpaqueIpcMessage)  >>
+}
+
+impl MultiWait {
+    pub fn new() -> Self {
+        Self {
+            set : IpcReceiverSet::new().unwrap(),
+            map : HashMap::new()
+        }
+    }
+    pub fn add(&mut self, process : & mut dyn Joinable) -> u64 {
+        let (rx, give_back) = process.intercept();
+        let id = self.set.add_opaque(rx).unwrap();
+        self.map.insert(id,give_back);
+        id
+    }
+    pub fn wait_events(&mut self) -> Option<Vec<u64>> {
+        if self.map.is_empty() {
+            return None;
+        }
+        let mut result = vec![];
+        for event in self.set.select().unwrap() {
+            match event {
+                IpcSelectionResult::MessageReceived(id, message) => {
+                    let give_back = &self.map[&id];
+                    give_back(message);
+                    result.push(id);
+                },
+                IpcSelectionResult::ChannelClosed(id) => {
+                    self.map.remove(&id);
+                }
+            }
+        }
+        Some(result)
+    }
+}
+

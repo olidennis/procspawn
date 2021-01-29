@@ -194,7 +194,7 @@ mod macros;
 pub use self::core::{assert_spawn_is_safe, init, ProcConfig};
 pub use self::error::{Location, PanicInfo, SpawnError};
 pub use self::pool::{Pool, PoolBuilder};
-pub use self::proc::{spawn, Builder, JoinHandle};
+pub use self::proc::{spawn, Builder, JoinHandle, MultiWait};
 
 #[cfg(feature = "async")]
 pub use self::asyncsupport::{spawn_async, AsyncJoinHandle};
